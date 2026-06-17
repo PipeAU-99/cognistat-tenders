@@ -375,362 +375,47 @@ async function fetchViaProxy(url) {
 // Fetch AusTender via its public OCDS API (has CORS headers — no proxy needed)
 // Returns up to 100 current ATMs published in the last 90 days with direct URLs
 async function fetchAusTenderOCDS(src) {
-  const endDate   = new Date();
-  const startDate = new Date();
-  startDate.setDate(startDate.getDate() - 90);
-  const fmt = d => d.toISOString().split('T')[0];
-  const url = `https://api.tenders.gov.au/ocds/findByDates/publishedDate/${fmt(startDate)}/${fmt(endDate)}?limit=100`;
-  try {
-    const r = await fetch(url, {signal: AbortSignal.timeout(20000)});
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
-    const releases = data.releases || data.records || [];
-    return releases.map(rel => {
-      // OCDS structure: release > tender
-      const tender  = rel.tender || rel.compiledRelease?.tender || {};
-      const planning = rel.planning || {};
-      const id      = rel.ocid || rel.id || '';
-      // Build the direct AusTender link from the ATM ID
-      // OCDS IDs look like: ocds-b5fd17-XXXXXXXXXX  — extract the numeric part
-      const atmId   = id.replace('ocds-b5fd17-','').replace('ocds-','');
-      const link    = atmId
-        ? `https://www.tenders.gov.au/Atm/Show/${atmId}`
-        : 'https://www.tenders.gov.au/atm';
-      return {
-        title:       tender.title || rel.title || 'Untitled',
-        description: tender.description || planning.rationale || '',
-        link,
-        pubDate:     rel.date || tender.tenderPeriod?.startDate || '',
-        category:    (tender.items?.[0]?.classification?.description) || tender.mainProcurementCategory || '',
-        source:      src.id,
-        sourceLabel: src.label,
-        type:        src.type,
-      };
-    }).filter(t => t.title && t.title !== 'Untitled');
-  } catch(e) {
-    throw new Error(`OCDS API: ${e.message}`);
-  }
-}
-
-function parseRSS(xml, src) {
-  if (!xml) return [];
-  try {
-    const doc = new DOMParser().parseFromString(xml, 'text/xml');
-    if (doc.querySelector('parsererror')) return [];
-    return [...doc.querySelectorAll('item')].map(item => {
-      // AusTender uses <link> as a text node between tags (not an attribute),
-      // and sometimes also provides <guid> with the direct URL.
-      // Try multiple strategies to get the most specific URL possible.
-      const guidEl   = item.querySelector('guid');
-      const guid     = guidEl?.textContent?.trim() || '';
-      // <link> in RSS 2.0 is tricky — it sits between tags, try nextSibling text
-      let link = '';
-      const linkEl = item.querySelector('link');
-      if (linkEl) {
-        // Try textContent first
-        link = linkEl.textContent?.trim() || '';
-        // If empty, try the text node that follows (RSS 2.0 quirk)
-        if (!link && linkEl.nextSibling) {
-          link = linkEl.nextSibling.textContent?.trim() || '';
-        }
-      }
-      // Prefer guid if it looks like a full URL with a path (more specific)
-      if (guid.startsWith('http') && guid.length > link.length) link = guid;
-      // Fall back to base portal URL if nothing found
-      if (!link) link = src.url.split('/public_data')[0].split('/?')[0];
-
-      const description = (item.querySelector('description')?.textContent || '').replace(/<[^>]*>/g,'').trim();
-      const title = item.querySelector('title')?.textContent?.trim() || '';
-      const pubDate = item.querySelector('pubDate')?.textContent?.trim() || '';
-      const category = item.querySelector('category')?.textContent?.trim() || '';
-
-      return { title, description, link, pubDate, category, source: src.id, sourceLabel: src.label, type: src.type };
-    }).filter(t => t.title.length > 5);
-  } catch(e) { return []; }
-}
-
-function hasKeyword(t) {
-  const txt = (t.title + ' ' + t.description + ' ' + t.category).toLowerCase();
-  return KEYWORDS.some(k => txt.includes(k));
-}
-
-// ─── AI analysis ─────────────────────────────────────────────────────────────
-async function analyseWithAI(batch) {
-  const key = getKey();
-  if (!key) return batch.map((_,i) => ({index:i+1,match:'low',score:0,reasoning:'No API key provided.',services:[]}));
-
-  const list = batch.map((t,i) =>
-    `[${i+1}] TYPE:${t.type.toUpperCase()} | Title: ${t.title}\nDesc: ${(t.description||'').slice(0,300)}\nCategory: ${t.category||'N/A'}`
-  ).join('\n\n');
-
-  const prompt = `You are a bid analyst for CogniStat, an Australian research and evaluation company.\n\n${PROFILE}\n\nEvaluate ${batch.length} opportunities below. Respond ONLY with a JSON array — no markdown, no extra text.\n\nFormat: [{"index":1,"match":"high|medium|low","score":0-100,"reasoning":"one sentence","services":["matching CogniStat service names"]}]\n\nhigh=score≥65 (clear fit), medium=35-64 (possible fit), low=<35\n\nOpportunities:\n${list}`;
-
-  try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': key,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true',
-      },
-      body: JSON.stringify({model:'claude-sonnet-4-6', max_tokens:1200, messages:[{role:'user',content:prompt}]}),
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(()=>({}));
-      addLog(`AI error: ${err.error?.message || res.status}`, 'err');
-      return batch.map((_,i) => ({index:i+1,match:'low',score:0,reasoning:`API error: ${err.error?.message||res.status}`,services:[]}));
-    }
-    const data = await res.json();
-    const text = data.content?.[0]?.text || '[]';
-    const clean = text.replace(/```json|```/g,'').trim();
-    return JSON.parse(clean);
-  } catch(e) {
-    addLog(`AI call failed: ${e.message}`, 'err');
-    return batch.map((_,i) => ({index:i+1,match:'low',score:0,reasoning:`Error: ${e.message}`,services:[]}));
-  }
-}
-
-// ─── UI helpers ──────────────────────────────────────────────────────────────
-function setSrcStatus(id, cls, txt) {
-  const el = document.getElementById('status-' + id);
-  if (el) { el.className = 'src-status ' + cls; el.textContent = txt; }
-}
-
-function addLog(msg, cls='') {
-  const log = document.getElementById('progressLog');
-  if (log) {
-    const div = document.createElement('div');
-    div.className = 'log-entry ' + cls;
-    div.textContent = msg;
-    log.appendChild(div);
-    log.scrollTop = log.scrollHeight;
-  }
-}
-
-function setProgress(pct, title) {
-  document.getElementById('progressBar').style.width = pct + '%';
-  document.getElementById('progressPct').textContent = Math.round(pct) + '%';
-  if (title) document.getElementById('progressTitle').textContent = title;
-}
-
-function isChecked(id) { const el = document.getElementById('src-'+id); return el ? el.checked : false; }
-function toggleAll(s) { SOURCES.forEach(src => { const el = document.getElementById('src-'+src.id); if(el) el.checked = s; }); }
-function setTab(el, match) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  el.classList.add('active');
-  activeMatchFilter = match;
-  visibleCount = 20;
-  if (allTenders.length) renderTenders();
-}
-function loadMore() { visibleCount += 20; renderTenders(); }
-
-// ─── Main fetch ──────────────────────────────────────────────────────────────
-async function startFetch() {
-  const key = getKey();
-  if (!key) {
-    alert('Please paste your Anthropic API key in the yellow bar at the top before fetching.');
-    return;
-  }
-
-  const btn = document.getElementById('fetchBtn');
-  btn.disabled = true; btn.textContent = '⏳ Scanning…';
-  document.getElementById('emptyState').style.display = 'none';
-  document.getElementById('statsRow').style.display = 'none';
-  document.getElementById('resultsHeader').style.display = 'none';
-  document.getElementById('tenderList').innerHTML = '';
-  document.getElementById('loadMoreRow').style.display = 'none';
-  document.getElementById('demoNotice').style.display = 'none';
-  document.getElementById('progressCard').style.display = 'block';
-  document.getElementById('progressLog').innerHTML = '';
-  allTenders = []; visibleCount = 20;
-
-  const selected = SOURCES.filter(s => isChecked(s.id));
-  let raw = [];
-  const total = selected.length;
-
-  // ── Phase 1: Fetch sources ──────────────────────────────────────────────
-  for (let i = 0; i < selected.length; i++) {
-    const src = selected[i];
-    setSrcStatus(src.id, 'src-loading', '⏳');
-    setProgress((i / total) * 45, `Fetching ${src.label}…`);
-    try {
-      let items = [];
-      if (src.mode === 'ocds') {
-        // AusTender OCDS API — direct fetch, no proxy needed, returns unique IDs
-        items = await fetchAusTenderOCDS(src);
-      } else {
-        // Other sources — try via CORS proxy
-        const text = await fetchViaProxy(src.url);
-        if (text && text.trimStart().startsWith('<')) {
-          items = parseRSS(text, src);
-        }
-      }
-      if (items.length > 0) {
-        raw.push(...items);
-        setSrcStatus(src.id, 'src-ok', '✓ ' + items.length);
-        addLog(`✓ ${src.label}: ${items.length} listings`, 'ok');
-      } else {
-        setSrcStatus(src.id, 'src-err', 'blocked');
-        addLog(`⚠ ${src.label}: blocked by CORS or no data`, 'err');
-      }
-    } catch(e) {
-      setSrcStatus(src.id, 'src-err', 'err');
-      addLog(`✗ ${src.label}: ${e.message}`, 'err');
-    }
-  }
-
-  // ── If no live data, load demo ────────────────────────────────────────
-  // Only fall back to demo if truly zero live results retrieved
-  if (raw.length === 0) {
-    addLog('No live feeds retrieved — loading demonstration data for AI scoring.', 'info');
-    raw = getDemoTenders();
-    raw.forEach(t => setSrcStatus(t.source, 'src-ok', 'DEMO'));
-    document.getElementById('demoNotice').style.display = 'flex';
-  } else {
-    addLog(`✓ ${raw.length} live listings collected — using real data.`, 'ok');
-    document.getElementById('demoNotice').style.display = 'none';
-  }
-
-  // ── Phase 2: AI scoring (all tenders — no keyword pre-filter) ────────
-  // AusTender RSS titles are very short, so keyword filtering gives false
-  // negatives. We send everything to Claude which reads titles properly.
-  setProgress(46, `Sending ${raw.length} listings to AI for scoring…`);
-  addLog(`Sending all ${raw.length} listings to AI scorer…`, 'info');
-
-  const BATCH = 8;
-  // Cap at 80 to keep API cost reasonable; sort by recency first
-  const toScore = raw.slice(0, 80);
-  let analysed = [];
-
-  for (let i = 0; i < toScore.length; i += BATCH) {
-    const batch = toScore.slice(i, i + BATCH);
-    const batchNum = Math.floor(i/BATCH) + 1;
-    const totalBatches = Math.ceil(toScore.length/BATCH);
-    const pct = 46 + ((i / toScore.length) * 50);
-    setProgress(pct, `AI scoring batch ${batchNum} of ${totalBatches}…`);
-    addLog(`Scoring batch ${batchNum}/${totalBatches} (${batch.length} tenders)…`);
-
-    const ratings = await analyseWithAI(batch);
-    batch.forEach((t, j) => {
-      const r = ratings.find(x => x.index === j+1) || {match:'low',score:5,reasoning:'',services:[]};
-      analysed.push({...t, match:r.match, score:r.score||0, reasoning:r.reasoning||'', services:r.services||[]});
-    });
-    addLog(`✓ Batch ${batchNum} complete`, 'ok');
-  }
-
-  allTenders = analysed.sort((a,b) => b.score - a.score);
-
-  setProgress(100, 'Complete!');
-  setTimeout(() => { document.getElementById('progressCard').style.display = 'none'; }, 2000);
-
-  updateStats();
-  renderTenders();
-
-  btn.disabled = false; btn.textContent = '🔄 Fetch All Sources';
-}
-
-// ─── Stats ───────────────────────────────────────────────────────────────────
-function updateStats() {
-  const high = allTenders.filter(t => t.match==='high').length;
-  const med  = allTenders.filter(t => t.match==='medium').length;
-  const gov  = allTenders.filter(t => t.type==='gov').length;
-  const ngo  = allTenders.filter(t => t.type==='ngo').length;
-  const uni  = allTenders.filter(t => t.type==='uni').length;
-  document.getElementById('statTotal').textContent = allTenders.length;
-  document.getElementById('statHigh').textContent  = high;
-  document.getElementById('statMed').textContent   = med;
-  document.getElementById('statBreak').textContent = `${gov} / ${ngo} / ${uni}`;
-  document.getElementById('statTime').textContent  = new Date().toLocaleTimeString('en-AU',{hour:'2-digit',minute:'2-digit',timeZone:'Australia/Melbourne'});
-  document.getElementById('statsRow').style.display = 'grid';
-}
-
-// ─── Render ───────────────────────────────────────────────────────────────────
-function renderTenders() {
-  const search = document.getElementById('searchInput').value.toLowerCase();
-  const f = activeMatchFilter;
-
-  let filtered = allTenders.filter(t => {
-    const txt = (t.title + ' ' + t.description).toLowerCase();
-    const ms = !search || txt.includes(search);
-    const mf = f==='all'?true : f==='high'?t.match==='high' : f==='medium'?t.match==='medium' : f==='gov'?t.type==='gov' : f==='ngo'?t.type==='ngo' : f==='uni'?t.type==='uni' : true;
-    return ms && mf;
-  });
-
-  document.getElementById('resultsHeader').style.display = 'flex';
-  document.getElementById('resultsCount').textContent = `${filtered.length} opportunit${filtered.length!==1?'ies':'y'}`;
-
-  const list = document.getElementById('tenderList');
-  list.innerHTML = '';
-
-  if (!filtered.length) {
-    list.innerHTML = `<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-title">No results</div><div>Try adjusting your filters or search term.</div></div>`;
-    document.getElementById('loadMoreRow').style.display = 'none';
-    return;
-  }
-
-  filtered.slice(0, visibleCount).forEach(t => {
-    const mc  = t.match==='high'?'high-match':t.match==='medium'?'medium-match':'low-match';
-    const pc  = t.match==='high'?'match-high':t.match==='medium'?'match-medium':'match-low';
-    const pt  = t.match==='high'?'✅ Strong Match':t.match==='medium'?'⚠️ Possible Match':'Low Match';
-    const sc  = t.score>=65?'score-high':t.score>=35?'score-medium':'score-low';
-    const stc = t.type==='gov'?'st-gov':t.type==='ngo'?'st-ngo':'st-uni';
-    const stl = t.type==='gov'?'🏛 Gov':t.type==='ngo'?'🤝 NGO':'🎓 Uni';
-    const dt  = t.pubDate ? new Date(t.pubDate).toLocaleDateString('en-AU',{day:'numeric',month:'short',year:'numeric'}) : '—';
-    const svcs = (t.services||[]).map(s=>`<span class="service-tag">${s}</span>`).join('');
-
-    const card = document.createElement('div');
-    card.className = `tender-card ${mc}`;
-    card.innerHTML = `
-      <div class="card-top">
-        <div class="tender-title">${t.title}</div>
-        <span class="match-pill ${pc}">${pt}</span>
-      </div>
-      <div class="score-bar"><div class="score-fill ${sc}" style="width:${Math.max(t.score,3)}%"></div></div>
-      <div class="tender-meta">
-        <span class="meta-item"><span class="source-type-pill ${stc}">${stl}</span></span>
-        <span class="meta-item">📅 ${dt}</span>
-        <span class="meta-item">📊 ${t.score}/100</span>
-        ${t.category?`<span class="meta-item">🏷 ${t.category}</span>`:''}
-      </div>
-      ${t.reasoning?`<div class="tender-reasoning">💡 ${t.reasoning}</div>`:''}
-      ${svcs?`<div class="tender-services">${svcs}</div>`:''}
-      <div class="card-footer">
-        <span class="tender-source-label">${t.sourceLabel}</span>
-        ${t.link?`<a href="${t.link}" target="_blank" rel="noopener" class="view-link">View →</a>`:'<span style="font-size:11px;color:var(--muted)">No link available</span>'}
-      </div>`;
-    list.appendChild(card);
-  });
-
-  document.getElementById('loadMoreRow').style.display = filtered.length > visibleCount ? 'block' : 'none';
-}
-
-// ─── Demo data ────────────────────────────────────────────────────────────────
-function getDemoTenders() {
-  const now = new Date().toUTCString();
-  // Each demo tender has a realistic portal URL so View links go somewhere useful
-  return [
-    {title:'National Community Health Survey — Design & Fieldwork', description:'Dept of Health seeks supplier for national health survey. Questionnaire design, sampling methodology, fieldwork coordination and data delivery.', pubDate:now, category:'Research', source:'federal', sourceLabel:'AusTender (Federal) — DEMO', type:'gov', link:'https://www.tenders.gov.au/atm'},
-    {title:'Program Evaluation — Youth Employment Initiative', description:'Evaluation firm for theory of change evaluation. Deliverables: evaluation framework, data collection instruments, impact measurement report to funders.', pubDate:now, category:'Evaluation', source:'federal', sourceLabel:'AusTender (Federal) — DEMO', type:'gov', link:'https://www.tenders.gov.au/atm'},
-    {title:'Statistical Modelling & Predictive Analytics — Social Services', description:'Advanced statistical modelling including regression and multivariate analysis. Dashboard development to track program outcomes across states.', pubDate:now, category:'Data Analytics', source:'nsw', sourceLabel:'NSW eTendering — DEMO', type:'gov', link:'https://tenders.nsw.gov.au'},
-    {title:'Monitoring & Evaluation Framework — Housing Affordability Program', description:'Design and implement M&E framework. KPI dashboards, data collection systems and impact measurement methodology.', pubDate:now, category:'Evaluation', source:'vic', sourceLabel:'VIC Buy.Vic — DEMO', type:'gov', link:'https://www.tenders.vic.gov.au'},
-    {title:'Community Needs Assessment — Regional Queensland', description:'Comprehensive needs assessment for rural communities. Survey design, fieldwork, data analysis and report to government stakeholders.', pubDate:now, category:'Research', source:'qld', sourceLabel:'QLD QTenders — DEMO', type:'gov', link:'https://qtenders.epw.qld.gov.au'},
-    {title:'Social Research Services Panel — Standing Offer Arrangement', description:'WA Govt panel for social research services including survey design, data collection, statistical analysis and program evaluation.', pubDate:now, category:'Social Research', source:'wa', sourceLabel:'WA Tenders — DEMO', type:'gov', link:'https://www.tenders.wa.gov.au'},
-    {title:'Population Survey — Housing Stress Indicators', description:'ACT Govt research firm for population survey measuring housing stress. Sample design, questionnaire, fieldwork and statistical reporting.', pubDate:now, category:'Social Research', source:'act', sourceLabel:'ACT Tenders — DEMO', type:'gov', link:'https://www.tenders.act.gov.au'},
-    {title:'Grant Program Evaluation — Disability Support Services', description:'Independent evaluation of disability support grants. Outcome measurement, stakeholder reporting, evidence synthesis for funders.', pubDate:now, category:'Grant Evaluation', source:'grants-gov', sourceLabel:'Community Grants Hub — DEMO', type:'ngo', link:'https://www.communitygrants.gov.au/grants'},
-    {title:'Aid Program Monitoring & Reporting — Pacific Region', description:'DFAT seeking M&E supplier for Pacific aid programs. Data collection, field surveys and impact reporting to government.', pubDate:now, category:'International Aid', source:'dfat', sourceLabel:'DFAT Aid Tenders — DEMO', type:'ngo', link:'https://www.dfat.gov.au/about-us/corporate-publications/tender-notices'},
-    {title:'Evidence Review — Mental Health Service Effectiveness', description:'Systematic review and evidence synthesis of mental health programs. Quantitative and qualitative analysis, stakeholder consultation and reporting.', pubDate:now, category:'Health Research', source:'grants', sourceLabel:'GrantConnect — DEMO', type:'ngo', link:'https://www.grants.gov.au/Go/List'},
-    {title:'DSS Social Policy Research — Family Outcomes Study', description:'Research design and data collection for longitudinal study on family outcomes. Instrument development, sampling, fieldwork management and analysis.', pubDate:now, category:'Social Policy', source:'dss', sourceLabel:'DSS Grants — DEMO', type:'ngo', link:'https://www.dss.gov.au/grants'},
-    {title:'Research Data Collection — Child Wellbeing Longitudinal Study', description:'University research project requires fieldwork provider for longitudinal data collection. Survey instrument design, sampling and quality control.', pubDate:now, category:'Academic Research', source:'uni-sydney', sourceLabel:'Univ. of Sydney — DEMO', type:'uni', link:'https://www.sydney.edu.au/about-us/governance-and-structure/tenders.html'},
-    {title:'Data Analytics & Student Outcomes Reporting Platform', description:'Monash seeking data analytics partner to model student outcomes. Predictive modelling, dashboard development and system integration.', pubDate:now, category:'Data Services', source:'uni-monash', sourceLabel:'Monash University — DEMO', type:'uni', link:'https://www.monash.edu/procurement/suppliers/sourcing/current-tenders'},
-    {title:'ARC Linkage — Industry Partner for Social Program Evaluation', description:'UQ seeking industry evaluation partner for ARC Linkage grant on social program effectiveness. Data collection and statistical analysis role.', pubDate:now, category:'Research Partnership', source:'uni-qld', sourceLabel:'Univ. of Queensland — DEMO', type:'uni', link:'https://pf.uq.edu.au/finance/procurement/current-tenders'},
-    {title:'Public Health Survey — Vaccine Hesitancy Study', description:'ANU seeking survey research partner for national vaccine hesitancy study. Questionnaire design, sampling framework, fieldwork and data delivery.', pubDate:now, category:'Public Health Research', source:'uni-anu', sourceLabel:'ANU — DEMO', type:'uni', link:'https://www.anu.edu.au/about/strategic-planning/procurement-and-contracts/current-tenders'},
-    {title:'Supply of Office Furniture — Government Fit-out', description:'Supply and installation of office furniture for government premises. Desks, chairs, storage units and fit-out services.', pubDate:now, category:'Furniture', source:'federal', sourceLabel:'AusTender (Federal) — DEMO', type:'gov', link:'https://www.tenders.gov.au/atm'},
-    {title:'IT Hardware Procurement — Desktop & Laptop Refresh', description:'Supply of 2,000 laptops and 500 desktops. Delivery, asset tagging and disposal of legacy equipment.', pubDate:now, category:'ICT Hardware', source:'nsw', sourceLabel:'NSW eTendering — DEMO', type:'gov', link:'https://tenders.nsw.gov.au'},
-    {title:'Grounds Maintenance Services — University Campus', description:'Supply of grounds maintenance and landscaping services for university campus. Regular mowing, garden care and tree maintenance.', pubDate:now, category:'Facilities', source:'uni-melb', sourceLabel:'Univ. of Melbourne — DEMO', type:'uni', link:'https://procurement.unimelb.edu.au/suppliers/tender-opportunities'},
+  // AusTender RSS — use two proxies for reliability
+  const rssUrl = 'https://www.tenders.gov.au/public_data/rss/rss.xml';
+  const proxies = [
+    'https://api.allorigins.win/get?url=',
+    'https://corsproxy.io/?url=',
+    'https://thingproxy.freeboard.io/fetch/',
   ];
+  for (const proxy of proxies) {
+    try {
+      const r = await fetch(proxy + encodeURIComponent(rssUrl), {signal: AbortSignal.timeout(15000)});
+      if (!r.ok) continue;
+      const d = await r.json();
+      const xml = d.contents || d.data || '';
+      if (!xml || !xml.includes('<item>')) continue;
+      const doc = new DOMParser().parseFromString(xml, 'text/xml');
+      if (doc.querySelector('parsererror')) continue;
+      const items = [...doc.querySelectorAll('item')].map(item => {
+        const title = item.querySelector('title')?.textContent?.trim() || '';
+        const description = (item.querySelector('description')?.textContent || '').replace(/<[^>]*>/g,'').trim();
+        // Try every possible way to get a specific URL from AusTender RSS
+        const guid = item.querySelector('guid')?.textContent?.trim() || '';
+        let link = '';
+        const linkEl = item.querySelector('link');
+        if (linkEl) {
+          link = linkEl.textContent?.trim() || '';
+          if (!link && linkEl.nextSibling) link = linkEl.nextSibling.textContent?.trim() || '';
+        }
+        // guid often contains the direct ATM URL like https://www.tenders.gov.au/Atm/Show/12345
+        if (guid.includes('tenders.gov.au') && guid.length > link.length) link = guid;
+        // Extract ATM ID from whichever URL we have and rebuild a clean direct link
+        const atmMatch = (link + ' ' + guid).match(/(?:Atm\/Show\/|ATM[_\/])([A-Z0-9_]+)/i);
+        if (atmMatch) link = `https://www.tenders.gov.au/Atm/Show/${atmMatch[1]}`;
+        // Last resort: use guid or link as-is if they look like real URLs
+        if (!link && guid.startsWith('http')) link = guid;
+        if (!link) link = 'https://www.tenders.gov.au/atm';
+        const pubDate = item.querySelector('pubDate')?.textContent?.trim() || '';
+        const category = item.querySelector('category')?.textContent?.trim() || '';
+        return {title, description, link, pubDate, category, source: src.id, sourceLabel: src.label, type: src.type};
+      }).filter(t => t.title.length > 5);
+      if (items.length > 0) return items;
+    } catch(e) { continue; }
+  }
+  throw new Error('All proxies failed for AusTender RSS');
 }
-</script>
-</body>
-</html>
